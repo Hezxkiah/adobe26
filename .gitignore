@@ -18,7 +18,5 @@ venv/
 /cr-renderer/
 
 # Generated run artifacts
-chameleon-starter/output/*
-!chameleon-starter/output/.gitkeep
-dummy-submission/output/*
-!dummy-submission/output/.gitkeep
+output/*
+!output/.gitkeep
