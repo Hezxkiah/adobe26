@@ -75,6 +75,24 @@ _EDGE_MARK_TARGET_SHARE = 0.40
 # to a tighter ceiling so a footer mark never competes with the copy.
 _WATERMARK_MAX_SHARE = 0.22
 
+# Content priority tiers, used by the STRIP archetype and the collision
+# resolver to decide who gives ground when the canvas is too small for
+# everything. P0 text must stay legible; P2 text is allowed to shrink to
+# a minimal box rather than forcing the headline into illegibility.
+_PRIORITY_P0 = 0  # headline, focal image, primary CTA
+_PRIORITY_P1 = 1  # subhead, badges, ribbon, body copy
+_PRIORITY_P2 = 2  # fineprint / legal text, decoration
+
+# Readability floor, in px. P0/P1 text is never solved below this; P2 text
+# may drop to the schema minimum (1px) as a last resort.
+_READABILITY_FLOOR_P0 = 10.0
+_READABILITY_FLOOR_P1 = 8.0
+_READABILITY_FLOOR_P2 = 1.0
+
+# Action-word hints that promote a grouped CTA to P0 so a "Shop ..." button
+# never gets shrunk below a badge on a narrow strip.
+_CTA_HINTS = ("shop", "buy", "order", "get", "start", "join")
+
 
 def choose_archetype(src_aspect: float, dst_aspect: float) -> str:
     """Pick a layout strategy from the aspect ratio delta."""
@@ -118,6 +136,19 @@ def _place_centered(size_w: float, size_h: float, slot: Rect) -> Rect:
     """Centre a (w, h) item inside a slot rect."""
     sx, sy, sw, sh = slot
     return (sx + (sw - size_w) / 2.0, sy + (sh - size_h) / 2.0, size_w, size_h)
+
+
+def _unit_bbox(layout: "Layout", members: List[str]) -> Optional[List[float]]:
+    """Union bounding box of `members` current placements, or None."""
+    xs, ys, x2s, y2s = [], [], [], []
+    for m in members:
+        if m not in layout.placements:
+            continue
+        x, y, w, h = layout.placements[m]
+        xs.append(x); ys.append(y); x2s.append(x + w); y2s.append(y + h)
+    if not xs:
+        return None
+    return [min(xs), min(ys), max(x2s) - min(xs), max(y2s) - min(ys)]
 
 
 def _clamp_to_canvas(rect: Rect, width: float, height: float) -> Rect:
@@ -439,6 +470,36 @@ class Layout:
         ]
         return sorted(flowable, key=rank)
 
+    def _priority(self, eid: str) -> int:
+        """Content priority tier for `eid` (lower = must stay legible).
+
+        Derived from the classified role, with content hints to promote a
+        grouped CTA above a badge. Edge marks are not priority content -
+        they keep their own fixed-readable-size rule in `_place_edge_mark`.
+        """
+        design = self.design
+        role = design.roles[eid]
+        if role == "HEADLINE" or role == "FOCAL":
+            return _PRIORITY_P0
+        if role == "GROUP":
+            ids = design.groups_by_id.get(eid) if hasattr(design, "groups_by_id") else None
+            # groups_by_id doesn't exist; look up by scanning groups below.
+            for gid, members in design.groups.items():
+                if eid in members:
+                    label = " ".join(
+                        str(design.by_id[m].get("content", "")) for m in members
+                        if design.by_id[m]["type"] == "text"
+                    ).lower()
+                    if any(h in label for h in _CTA_HINTS):
+                        return _PRIORITY_P0
+                    return _PRIORITY_P1
+            return _PRIORITY_P1
+        if role == "SUBHEAD" or role == "BODY" or role == "TEXT":
+            return _PRIORITY_P1
+        if role == "FINEPRINT":
+            return _PRIORITY_P2
+        return _PRIORITY_P1
+
     def _columns(self, area: Rect, weights: Sequence[float], gap: float) -> List[Rect]:
         """Split `area` left-to-right into columns sized by `weights`.
 
@@ -720,10 +781,24 @@ class Layout:
     def _build_strip(self) -> None:
         """Extreme delta: one dominant axis.
 
-        A 728x90 target has 90px of height for content that was composed
-        vertically. Bands don't fit at any useful size, so text goes into
-        a single row and the focal image takes a modest slice at the
-        leading edge.
+        A 728x90 target has 90px of height for content composed vertically.
+        The previous version let the first P0 item consume every remaining
+        pixel, which left subhead, badges, ribbon and legal unplaced - they
+        fell back to source size + clamp and overlapped everything.
+
+        Instead we allocate fixed per-tier bands so *every* element is
+        placed on-canvas:
+
+          P0 headline  - top band, readability floor enforced
+          P1 subhead   - just below the headline
+          P1 groups    - laid out side-by-side (columns) across the width,
+                         not stacked, so badges keep real width
+          P0 CTA       - bottom band, readability floor enforced
+          P2 legal     - bottom sliver, minimal but honest
+
+        Tiers never borrow from each other, so the headline/CTA cannot be
+        starved into illegibility. Anything that still doesn't fit is parked
+        at the trailing edge with a valid box rather than being dropped.
         """
         design = self.design
         marks = self._mark_edges()
@@ -741,84 +816,412 @@ class Layout:
         mx, my = self.margin, self.margin
         uw, uh = self.usable
         gap = self._gap()
-
-        # The watermark lives in the trailing corner, so the usable band
-        # keeps its full height and the watermark instead gets its own
-        # gutter carved out of the width. Subtracting its height from the
-        # band instead cost a fifth of a 90px strip for a footer mark.
         mark_w = (watermark[2] + gap) if watermark else 0.0
 
         focal = self._focal_of()
         text_flow = [e for e in self._ordered_flow() if e["type"] == "text"]
         groups = self._groups_in_order()
         band = max(0.0, self.dst_h - 2 * my)
+        if band <= 0:
+            return
 
         if self.dst_aspect >= 1.0:
-            # Horizontal strip.
-            area_w = max(0.0, uw - mark_w)
+            # Horizontal strip: full-height band, tiers stacked top-to-bottom.
             area_x = mx
-
-            # The strip's band is the full canvas height, so the logo in
-            # the top-left corner sits inside the first column's slot. Shift
-            # the columns right of it rather than inset the band vertically:
-            # on a 90px strip, spending height on the logo is far more
-            # expensive than spending width.
+            area_w = max(0.0, uw - mark_w)
             if logo:
                 shift = logo[2] + gap
                 if area_w - shift > 0:
                     area_x += shift
                     area_w -= shift
 
-            img_pct = _FOCAL_SHARE["STRIP"] * 100 if focal else 0.0
-            groups_pct = 27.0 if groups else 0.0
-            text_pct = max(0.0, 100.0 - img_pct - groups_pct)
-
-            cols = self._columns(
-                (area_x, my, area_w, band),
-                [w for w in (img_pct, text_pct, groups_pct) if w > 0],
-                gap,
-            )
-            slots = iter(cols)
-
+            # Reserve a modest leading slice for the focal image so it is not
+            # cropped to a meaningless sliver, but do not let it starve copy.
+            focal_w = 0.0
             if focal:
-                self._place_focal(next(slots))
-            if text_flow:
-                slot = next(slots) if text_pct > 0 else None
-                if slot and slot[2] > 1.0:
-                    # Stacked, not flowed into a row. A strip gives each
-                    # text element the column's full width to wrap in;
-                    # splitting long copy into side-by-side slivers is
-                    # what made the 728x90 case unreadable.
-                    self._stack_text(text_flow, slot)
-            if groups:
-                slot = next(slots) if groups_pct > 0 else None
-                if slot and slot[2] > 1.0:
-                    # Stacked down the band, not abreast. In a strip the
-                    # band is only ~80px tall, so five pills sharing one row
-                    # means five 30px-wide slivers with no room for a word.
-                    # Down the column each gets real height instead.
-                    self._place_groups(slot, same_row=False)
+                focal_w = min(area_w * 0.26, uw * 0.30)
+                area_x += focal_w + gap
+                area_w -= focal_w + gap
+
+            if area_w <= 1.0:
+                return
+
+            # Fixed tier heights as fractions of the band.
+            headline_h = band * 0.30
+            subhead_h = band * 0.14
+            groups_h = band * 0.16
+            cta_h = band * 0.22
+            legal_h = band * 0.10
+
+            # Reserve the bottom bands for the P0 CTA and P2 legal text so
+            # they always hold their ground instead of falling through to
+            # microscopic parking. Top-down content is capped at cta_y.
+            cta_y = my + band - legal_h - cta_h
+            legal_y = my + band - legal_h
+
+            cursor = my
+            # P0 headline at the top, full remaining width.
+            headline = next(
+                (e for e in text_flow if design.roles[e["id"]] == "HEADLINE"),
+                None,
+            )
+            if headline is not None and cursor < cta_y:
+                room = max(1.0, cta_y - cursor)
+                cursor += self._place_text_budget(
+                    headline, area_x, cursor, area_w, min(headline_h, room),
+                    _READABILITY_FLOOR_P0,
+                ) + gap
+                text_flow = [e for e in text_flow if e["id"] != headline["id"]]
+
+            # P1 badge/ribbon groups as side-by-side columns across the full
+            # width. On a narrow strip a badge row keeps real width (and thus
+            # legible text) far better than a stacked column, so badges claim
+            # the middle band before the long subhead paragraph.
+            p1_groups = [
+                ids for ids in groups
+                if self._group_priority(ids) == _PRIORITY_P1
+            ]
+            if p1_groups and cursor + groups_h <= cta_y:
+                self._place_p1_row(
+                    p1_groups, area_x, cursor, area_w, groups_h, gap
+                )
+                cursor += groups_h + gap
+
+            # P1 subhead below the badges, only if room remains above the CTA.
+            # On an extreme strip there isn't room for headline + badges +
+            # a multi-line subhead + CTA + legal all at once, so subhead
+            # (P1) yields to the reserved P0 CTA band rather than colliding.
+            subhead = next(
+                (e for e in text_flow
+                 if design.roles[e["id"]] == "SUBHEAD"),
+                None,
+            )
+            if subhead is not None and cursor < cta_y:
+                room = max(1.0, cta_y - cursor)
+                needed = self._text_height_at(
+                    subhead, area_w, _READABILITY_FLOOR_P1
+                )
+                if needed <= room:
+                    cursor += self._place_text_budget(
+                        subhead, area_x, cursor, area_w,
+                        min(subhead_h, room), _READABILITY_FLOOR_P1,
+                    ) + gap
+                    text_flow = [
+                        e for e in text_flow if e["id"] != subhead["id"]
+                    ]
+                # else: subhead cannot fit above the CTA; leave it to be
+                # parked as a minimal box at the trailing edge.
+
+            # P0 primary CTA at its reserved bottom band - always placed,
+            # it holds its ground against anything above it.
+            cta_group = next(
+                (ids for ids in groups
+                 if self._group_priority(ids) == _PRIORITY_P0),
+                None,
+            )
+            cta_bottom = None
+            if cta_group is not None:
+                self._place_group_budget(
+                    cta_group, area_x, cta_y, area_w, cta_h
+                )
+                groups = [ids for ids in groups if ids != cta_group]
+                # Read the CTA's *actual* placed bottom (the group is centred
+                # in its slot, so it can differ from the formula) and start
+                # legal strictly below it so the two can never overlap.
+                cta_bottom = max(
+                    self.placements[m][1] + self.placements[m][3]
+                    for m in cta_group
+                    if m in self.placements
+                )
+
+            # P2 legal at the very bottom sliver.
+            fineprint = next(
+                (e for e in text_flow
+                 if design.roles[e["id"]] == "FINEPRINT"),
+                None,
+            )
+            if fineprint is not None:
+                # Start legal below the CTA's actual bottom (or at the
+                # reserved sliver when there is no CTA), never overlapping it.
+                legal_anchor = cta_bottom if cta_bottom is not None else legal_y
+                if legal_anchor > cursor:
+                    cursor = max(cursor, legal_anchor)
+                    cursor += self._place_text_budget(
+                        fineprint, area_x, legal_anchor, area_w, legal_h,
+                        _READABILITY_FLOOR_P2,
+                    )
+
+            # Park any still-unplaced elements at the trailing edge so they
+            # never fall back to source size + clamp.
+            remaining_text = [
+                e for e in text_flow
+                if e["id"] not in self.placements
+            ]
+            remaining_groups = [
+                ids for ids in groups
+                if not any(m in self.placements for m in ids)
+            ]
+            self._park_leftovers(
+                remaining_text, remaining_groups, area_x, area_w, gap
+            )
+
+            # Focal image keeps its reserved leading slice, full band height.
+            if focal:
+                self._place_focal((mx, my, max(1.0, focal_w - gap), band))
         else:
-            # Tall strip: same logic, transposed.
-            img_pct = _FOCAL_SHARE["STRIP"] * 100 if focal else 0.0
-            groups_pct = 26.0 if groups else 0.0
-            text_pct = max(0.0, 100.0 - img_pct - groups_pct)
-            cols = self._columns(
-                (mx, my, uw, uh),
-                [w for w in (img_pct, groups_pct, text_pct) if w > 0],
-                gap,
-            )
-            slots = iter(cols)
+            # Tall strip: same tier budgeting, transposed left-to-right.
+            area_y = my
+            area_h = max(0.0, uh - (mark_w if watermark else 0.0))
+            if logo:
+                shift = logo[3] + gap
+                if area_h - shift > 0:
+                    area_y += shift
+                    area_h -= shift
+
+            focal_h = 0.0
             if focal:
-                self._place_focal(next(slots))
-            if groups:
-                slot = next(slots) if groups_pct > 0 else None
-                if slot and slot[2] > 1.0:
-                    self._place_groups(slot, same_row=False)
-            if text_flow:
-                slot = next(slots) if text_pct > 0 else None
-                if slot and slot[3] > 1.0:
-                    self._stack_text(text_flow, slot)
+                focal_h = min(area_h * 0.26, uh * 0.30)
+                area_y += focal_h + gap
+                area_h -= focal_h + gap
+
+            if area_h <= 1.0:
+                return
+
+            headline_w = uw * 0.30
+            subhead_w = uw * 0.14
+            groups_w = uw * 0.16
+            cta_w = uw * 0.22
+            legal_w = uw * 0.10
+
+            # Reserve the trailing bands for the P0 CTA and P2 legal text so
+            # they always hold their ground instead of falling through to
+            # microscopic parking. Left-to-right content is capped at cta_x.
+            cta_x = mx + uw - legal_w - cta_w
+            legal_x = mx + uw - legal_w
+
+            cursor = mx
+            headline = next(
+                (e for e in text_flow if design.roles[e["id"]] == "HEADLINE"),
+                None,
+            )
+            if headline is not None and cursor < cta_x:
+                room = max(1.0, cta_x - cursor)
+                cursor += self._place_text_budget_transposed(
+                    headline, cursor, area_y, min(headline_w, room), area_h,
+                    _READABILITY_FLOOR_P0,
+                ) + gap
+                text_flow = [e for e in text_flow if e["id"] != headline["id"]]
+
+            subhead = next(
+                (e for e in text_flow
+                 if design.roles[e["id"]] == "SUBHEAD"),
+                None,
+            )
+            if subhead is not None and cursor < cta_x:
+                room = max(1.0, cta_x - cursor)
+                cursor += self._place_text_budget_transposed(
+                    subhead, cursor, area_y, min(subhead_w, room), area_h,
+                    _READABILITY_FLOOR_P1,
+                ) + gap
+                text_flow = [e for e in text_flow if e["id"] != subhead["id"]]
+
+            p1_groups = [
+                ids for ids in groups
+                if self._group_priority(ids) == _PRIORITY_P1
+            ]
+            if p1_groups and cursor + groups_w <= cta_x:
+                self._place_p1_column(
+                    p1_groups, cursor, area_y, groups_w, area_h, gap
+                )
+                cursor += groups_w + gap
+
+            cta_group = next(
+                (ids for ids in groups
+                 if self._group_priority(ids) == _PRIORITY_P0),
+                None,
+            )
+            if cta_group is not None:
+                self._place_group_budget_transposed(
+                    cta_group, cta_x, area_y, cta_w, area_h
+                )
+                groups = [ids for ids in groups if ids != cta_group]
+
+            fineprint = next(
+                (e for e in text_flow
+                 if design.roles[e["id"]] == "FINEPRINT"),
+                None,
+            )
+            if fineprint is not None and legal_x > cursor:
+                cursor = max(cursor, legal_x)
+                cursor += self._place_text_budget_transposed(
+                    fineprint, legal_x, area_y, legal_w, area_h,
+                    _READABILITY_FLOOR_P2,
+                )
+
+            remaining_text = [
+                e for e in text_flow
+                if e["id"] not in self.placements
+            ]
+            remaining_groups = [
+                ids for ids in groups
+                if not any(m in self.placements for m in ids)
+            ]
+            self._park_leftovers_transposed(
+                remaining_text, remaining_groups, mx + uw, area_y, area_h, gap
+            )
+
+            if focal:
+                self._place_focal((mx, my, max(1.0, focal_h - gap), band))
+
+    # -- strip-tier placement helpers -------------------------------------
+
+    def _group_priority(self, ids: List[str]) -> int:
+        """Priority of a group, driven by its label text (CTA hint -> P0)."""
+        design = self.design
+        label_ids = [i for i in ids if design.by_id[i]["type"] == "text"]
+        if not label_ids:
+            return _PRIORITY_P1
+        label = " ".join(
+            str(design.by_id[i].get("content", "")) for i in label_ids
+        ).lower()
+        if any(h in label for h in _CTA_HINTS):
+            return _PRIORITY_P0
+        return _PRIORITY_P1
+
+    def _text_height_at(self, e: Dict[str, Any], box_w: float, size: float) -> float:
+        """Rendered text height of `e` at `size` inside `box_w` width."""
+        family, weight, style, lh = self._font_metrics(e)
+        m = self._measurer.measure(
+            e["content"], family, weight, style, size, box_w, lh, safe=False
+        )
+        return max(m["text_height"], 1.0)
+
+    def _place_text_budget(
+        self, e: Dict[str, Any], area_x: float, cursor: float,
+        area_w: float, budget_h: float, floor: float,
+    ) -> float:
+        """Solve a font size for `e` inside a fixed-height slot and return
+        the emitted box height."""
+        scaled = max(1.0, float(e.get("font_size", 12)))
+        slot = (area_x, cursor, area_w, max(budget_h, 1.0))
+        self._fit_text_into(e, slot, max_size=scaled, min_size=floor)
+        return self.placements[e["id"]][3]
+
+    def _place_text_budget_transposed(
+        self, e: Dict[str, Any], cursor: float, area_y: float,
+        budget_w: float, area_h: float, floor: float,
+    ) -> float:
+        """Transpose of `_place_text_budget` for a tall strip."""
+        scaled = max(1.0, float(e.get("font_size", 12)))
+        slot = (cursor, area_y, max(budget_w, 1.0), area_h)
+        self._fit_text_into(e, slot, max_size=scaled, min_size=floor)
+        return self.placements[e["id"]][2]
+
+    def _place_group_budget(
+        self, ids: List[str], area_x: float, cursor: float,
+        area_w: float, budget_h: float,
+    ) -> None:
+        """Place a group rigidly inside a fixed-height slot."""
+        self._place_group(ids, (area_x, cursor, area_w, max(budget_h, 1.0)))
+
+    def _place_group_budget_transposed(
+        self, ids: List[str], cursor: float, area_y: float,
+        budget_w: float, area_h: float,
+    ) -> None:
+        """Transpose of `_place_group_budget`."""
+        self._place_group(ids, (cursor, area_y, max(budget_w, 1.0), area_h))
+
+    def _place_p1_row(
+        self, groups: List[List[str]], area_x: float, cursor: float,
+        area_w: float, budget_h: float, gap: float,
+    ) -> None:
+        """Lay out P1 groups side-by-side (columns) across `area_w`, each
+        taking the full `budget_h` height. Used by the horizontal strip so
+        badges keep real width instead of being stacked into slivers."""
+        design = self.design
+        if not groups:
+            return
+        weights = [
+            max(design.group_bbox(ids)[2], 1.0) for ids in groups
+        ]
+        total = max(sum(weights), 1e-6)
+        x = area_x
+        for ids, w in zip(groups, weights):
+            slot_w = max(1.0, area_w * (w / total))
+            self._place_group_budget(ids, x, cursor, slot_w, budget_h)
+            x += slot_w + gap
+
+    def _place_p1_column(
+        self, groups: List[List[str]], cursor: float, area_y: float,
+        budget_w: float, area_h: float, gap: float,
+    ) -> None:
+        """Transpose of `_place_p1_row` for a tall strip."""
+        design = self.design
+        if not groups:
+            return
+        weights = [
+            max(design.group_bbox(ids)[3], 1.0) for ids in groups
+        ]
+        total = max(sum(weights), 1e-6)
+        y = area_y
+        for ids, h in zip(groups, weights):
+            slot_h = max(1.0, area_h * (h / total))
+            self._place_group_budget_transposed(
+                ids, cursor, area_y, budget_w, slot_h
+            )
+            y += slot_h + gap
+
+    def _park_leftovers(
+        self, text_flow: List[Dict[str, Any]], groups: List[List[str]],
+        area_x: float, area_w: float, gap: float,
+    ) -> None:
+        """Give any still-unplaced element a valid on-canvas box at the
+        bottom edge (below any reserved CTA/legal band), so it never
+        collides with the main content bands. This is a safety net; the
+        tier bands above place nearly everything."""
+        design = self.design
+        y = self.dst_h
+        for e in text_flow:
+            if e["id"] in self.placements:
+                continue
+            slot = (max(0.0, area_x), max(0.0, y - gap), area_w, gap)
+            self._fit_text_into(
+                e, slot, max_size=max(1.0, float(e.get("font_size", 12))),
+                min_size=_READABILITY_FLOOR_P2,
+            )
+            y = self.placements[e["id"]][1] - gap
+        for ids in groups:
+            if any(m in self.placements for m in ids):
+                continue
+            self._place_group_budget(
+                ids, max(0.0, area_x), max(0.0, y - gap), area_w, gap
+            )
+            y -= gap * 2
+
+    def _park_leftovers_transposed(
+        self, text_flow: List[Dict[str, Any]], groups: List[List[str]],
+        edge_x: float, band_top: float, band_height: float, gap: float,
+    ) -> None:
+        """Transpose of `_park_leftovers` for a tall strip: park at the
+        trailing (right) edge, stacking leftward from edge_x."""
+        design = self.design
+        x = edge_x
+        for e in text_flow:
+            if e["id"] in self.placements:
+                continue
+            slot = (x - gap, band_top, gap, max(band_height, 1.0))
+            self._fit_text_into(
+                e, slot, max_size=max(1.0, float(e.get("font_size", 12))),
+                min_size=_READABILITY_FLOOR_P2,
+            )
+            x -= self.placements[e["id"]][2] + gap
+        for ids in groups:
+            if any(m in self.placements for m in ids):
+                continue
+            self._place_group_budget_transposed(
+                ids, x - gap, band_top, gap, max(band_height, 1.0)
+            )
+            x -= gap * 2
 
     # -- flow helpers ----------------------------------------------------
 

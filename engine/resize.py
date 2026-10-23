@@ -34,7 +34,7 @@ Hard requirements (see RULES.md):
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from .classify import Design
 from .layout import Layout
@@ -164,6 +164,133 @@ def _apply_group_strokes(design: Design, layout: Layout) -> None:
                 e["stroke_width"] = max(0.0, float(e["stroke_width"]) * scale)
 
 
+def _unit_bbox(layout: Layout, members: List[str]) -> Optional[List[float]]:
+    """Union bounding box of `members` current placements, or None."""
+    xs, ys, x2s, y2s = [], [], [], []
+    for m in members:
+        if m not in layout.placements:
+            continue
+        x, y, w, h = layout.placements[m]
+        xs.append(x); ys.append(y); x2s.append(x + w); y2s.append(y + h)
+    if not xs:
+        return None
+    return [min(xs), min(ys), max(x2s) - min(xs), max(y2s) - min(ys)]
+
+
+def _overlaps(a: List[float], b: List[float]) -> bool:
+    return (
+        min(a[0] + a[2], b[0] + b[2]) > max(a[0], b[0])
+        and min(a[1] + a[3], b[1] + b[3]) > max(a[1], b[1])
+    )
+
+
+def _yield_rect(rect: List[float], blocker: List[float],
+                dst_w: float, dst_h: float) -> Optional[List[float]]:
+    """Nudge `rect` so it no longer overlaps `blocker`, staying on-canvas.
+
+    Prefers the separation axis with the smaller overlap and the move with
+    the least distance. Returns None if no on-canvas separation exists.
+    """
+    rx, ry, rw, rh = rect
+    px, py, pw, ph = blocker
+    ox = min(rx + rw, px + pw) - max(rx, px)
+    oy = min(ry + rh, py + ph) - max(ry, py)
+    if ox <= 0 or oy <= 0:
+        return list(rect)
+
+    candidates = [
+        (rx, py + ph, rw, rh),   # below blocker
+        (rx, py - rh, rw, rh),   # above blocker
+        (px + pw, ry, rw, rh),   # right of blocker
+        (px - rw, ry, rw, rh),   # left of blocker
+    ]
+    best = None
+    best_score = None
+    for cx, cy, cw, ch in candidates:
+        on_canvas = (cx >= 0 and cy >= 0 and cx + cw <= dst_w and cy + ch <= dst_h)
+        dist = abs(cx - rx) + abs(cy - ry)
+        score = (0 if on_canvas else 1, dist)
+        if best_score is None or score < best_score:
+            best_score = score
+            best = (cx, cy, cw, ch)
+    if best is None:
+        return None
+    cx, cy, cw, ch = best
+    # Clamp back onto the canvas if a move landed slightly outside.
+    cx = max(0.0, min(cx, dst_w - cw))
+    cy = max(0.0, min(cy, dst_h - ch))
+    return [cx, cy, cw, ch]
+
+
+def _resolve_collisions(design: Design, layout: Layout,
+                        dst_w: float, dst_h: float) -> None:
+    """Post-layout pass that separates overlapping non-decorative elements.
+
+    Higher-priority content (P0 headline/CTA/focal) holds its ground;
+    lower-priority content is nudged aside. Group members move together so
+    pills stay glued to their labels. Text boxes move without changing
+    font size, so solved text still fits its box.
+    """
+    grouped_eids = {m for members in design.groups.values() for m in members}
+
+    # Build units: groups move rigidly; standalone elements move alone.
+    units = []
+    for gid, members in design.groups.items():
+        bbox = _unit_bbox(layout, members)
+        if bbox is None:
+            continue
+        units.append({
+            "members": list(members), "bbox": bbox,
+            "prio": min(layout._priority(m) for m in members),
+        })
+    for eid, rect in layout.placements.items():
+        if eid in grouped_eids:
+            continue
+        if design.roles[eid] in ("FULL_BLEED", "DECORATIVE"):
+            continue
+        units.append({
+            "members": [eid], "bbox": list(rect),
+            "prio": layout._priority(eid),
+        })
+
+    units.sort(key=lambda u: u["prio"])
+
+    # Iterate to convergence: a nudge can push one unit into another, so
+    # repeat until no overlaps remain (capped to avoid infinite loops).
+    placed: List[Tuple[List[str], List[float]]] = []
+    for _pass in range(10):
+        any_overlap = False
+        placed = []
+        for u in units:
+            rect = list(u["bbox"])
+            dx_total = dy_total = 0.0
+            for _pmembers, pbbox in placed:
+                if not _overlaps(rect, pbbox):
+                    continue
+                any_overlap = True
+                new_rect = _yield_rect(rect, pbbox, dst_w, dst_h)
+                if new_rect is None:
+                    continue
+                dx_total += new_rect[0] - rect[0]
+                dy_total += new_rect[1] - rect[1]
+                rect = new_rect
+            for m in u["members"]:
+                if m not in layout.placements:
+                    continue
+                x, y, w, h = layout.placements[m]
+                layout.placements[m] = (x + dx_total, y + dy_total, w, h)
+                u["bbox"][0] = x + dx_total
+                u["bbox"][1] = y + dy_total
+            placed.append((u["members"], list(u["bbox"])))
+        # Re-read bboxes from placements so the next pass uses current state.
+        for u in units:
+            bb = _unit_bbox(layout, u["members"])
+            if bb is not None:
+                u["bbox"] = bb
+        if not any_overlap:
+            break
+
+
 def resize(source: Dict[str, Any], target_canvas: Dict[str, Any]) -> Dict[str, Any]:
     """Reflow `source` into `target_canvas`.
 
@@ -185,6 +312,11 @@ def resize(source: Dict[str, Any], target_canvas: Dict[str, Any]) -> Dict[str, A
 
     layout = Layout(design, dst_w, dst_h)
     layout.assign()
+
+    # Last-mile collision resolver: separate any overlaps that survived
+    # archetype placement so P0 content (headline/CTA/focal) holds ground
+    # and nothing renders on top of its neighbour.
+    _resolve_collisions(design, layout, dst_w, dst_h)
 
     backgrounds = _place_backgrounds(design, dst_w, dst_h)
     decorative = _place_decorative(design, layout, dst_w, dst_h)
