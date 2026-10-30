@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from engine.resize import resize
+from engine.contrast import check_contrast
 
 # Relative to the current working directory, which is /app both inside the
 # Docker image (WORKDIR /app) and when run locally from this repo's root -
@@ -122,14 +123,19 @@ def main() -> int:
         elapsed = time.time() - t0
 
         problems = self_check(source, output)
+        contrast_warnings = check_contrast(source, output, ASSETS_DIR)
         stem = task_path.stem
         (OUTPUT_DIR / f"{stem}_output.json").write_text(json.dumps(output, indent=2))
         render_to_png(output, ASSETS_DIR, OUTPUT_DIR / f"{stem}_output.png")
 
         status = "OK" if not problems else f"{len(problems)} self-check warning(s)"
+        if contrast_warnings:
+            status += f" ({len(contrast_warnings)} contrast warning(s))"
         print(f"[{task_path.name}] {status} in {elapsed:.2f}s "
               f"-> {stem}_output.json, {stem}_output.png")
         for p in problems:
+            print(f"    - {p}")
+        for p in contrast_warnings:
             print(f"    - {p}")
 
     return exit_code
